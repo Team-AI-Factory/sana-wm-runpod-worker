@@ -10,14 +10,20 @@ WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 SANA_HOME="${SANA_HOME:-/workspace/Sana}"
 MINICONDA_DIR="${MINICONDA_DIR:-/workspace/miniconda}"
 HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
+PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/.cache/pip}"
 
 export HF_HOME
+export PIP_CACHE_DIR
 export CONDA_PLUGINS_AUTO_ACCEPT_TOS="${CONDA_PLUGINS_AUTO_ACCEPT_TOS:-yes}"
 export PYTHONUNBUFFERED=1
 export MAX_JOBS="${MAX_JOBS:-8}"
 export NVCC_THREADS="${NVCC_THREADS:-2}"
 
-mkdir -p "$WORKSPACE_DIR" "$HF_HOME" /workspace/job-input /workspace/results
+# Fix for RunPod / CUDA activation script.
+# Some CUDA conda activation scripts expect this variable to exist.
+export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:-}"
+
+mkdir -p "$WORKSPACE_DIR" "$HF_HOME" "$PIP_CACHE_DIR" /workspace/job-input /workspace/results
 
 echo "STAGE_CHECK_ENV_STARTED"
 
@@ -67,7 +73,13 @@ else
 fi
 
 export PATH="$MINICONDA_DIR/bin:$PATH"
+
+# Conda activation scripts can reference optional variables.
+# Temporarily relax strict undefined-variable mode while loading conda.
+set +u
 source "$MINICONDA_DIR/etc/profile.d/conda.sh"
+set -u
+
 echo "STAGE_MINICONDA_DONE"
 
 echo "STAGE_SANA_REPO_STARTED"
@@ -97,7 +109,15 @@ fi
 echo "STAGE_SANA_ENV_DONE"
 
 echo "STAGE_HELPERS_STARTED"
+
+# Fix again before activation, because CUDA activation reads this variable.
+export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:-}"
+
+# Temporarily relax strict mode while conda activates the environment.
+set +u
 conda activate sana
+set -u
+
 pip install --upgrade boto3 pillow imageio imageio-ffmpeg
 echo "STAGE_HELPERS_DONE"
 
