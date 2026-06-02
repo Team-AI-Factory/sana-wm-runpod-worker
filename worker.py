@@ -7,6 +7,7 @@ from pathlib import Path
 import boto3
 import numpy as np
 from botocore.client import Config
+from botocore.exceptions import ClientError
 from PIL import Image, ImageDraw
 
 
@@ -14,6 +15,7 @@ WORKSPACE = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
 SANA_HOME = Path(os.environ.get("SANA_HOME", "/workspace/Sana"))
 JOB_INPUT_DIR = WORKSPACE / "job-input"
 RESULTS_DIR = WORKSPACE / "results"
+POLL_SECONDS = int(os.environ.get("WORKER_POLL_SECONDS", "30"))
 
 
 def now_id():
@@ -65,6 +67,10 @@ def load_job(s3, bucket, job_key):
     return json.loads(raw)
 
 
+def clear_active_job(s3, bucket, job_key):
+    s3.delete_object(Bucket=bucket, Key=job_key)
+
+
 def create_fallback_reference_image(prompt, output_path):
     width, height = 1280, 704
     text = prompt.lower()
@@ -106,9 +112,18 @@ def download_reference_image_if_available(s3, bucket, job, output_path):
 
 
 def choose_settings(job):
-    duration = int(job.get("duration_seconds", 60))
+    duration_seconds = job.get("duration_seconds", 60)
+    duration_label = str(job.get("duration_label", "")).lower()
+    duration_text = str(job.get("duration", "")).lower()
 
-    if duration >= 60:
+    is_tiny = (
+        duration_label == "tiny test"
+        or duration_text == "tiny test"
+        or duration_text == "tiny"
+        or int(duration_seconds) < 60
+    )
+
+    if not is_tiny:
         return {
             "num_frames": int(os.environ.get("FULL_NUM_FRAMES", "321")),
             "step": int(os.environ.get("FULL_STEP", "20")),
@@ -129,11 +144,156 @@ def run_command(command, cwd):
         raise RuntimeError(f"Command failed with exit code {process.returncode}")
 
 
-def find_mp4():
-    files = sorted(RESULTS_DIR.rglob("*.mp4"))
-    if not files:
-        raise RuntimeError("No MP4 file found in results directory")
-    return files[0]
+def find_new_mp4(existing_files, preferred_job_id=""):
+    all_files = list(RESULTS_DIR.rglob("*.mp4"))
+    new_files = [f for f in all_files if str(f) not in existing_files]
+
+    if not new_files and preferred_job_id:
+        new_files = [f for f in all_files if preferred_job_id in f.name or preferred_job_id in str(f)]
+
+    if not new_files:
+        raise RuntimeError("No new MP4 file found in results directory")
+
+    new_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return new_files[0]
+
+
+def process_one_job(s3, bucket, job_key, job):
+    job_id = job.get("job_id") or ("sana-wm-runpod-" + now_id())
+    prompt = job.get("prompt") or job.get("video_prompt") or "A peaceful cinematic nature scene."
+    action = job.get("action") or "w-80,jw-40,w-40,lw-60,w-100"
+
+    stage(s3, bucket, job_id, "JOB_LOAD_DONE", "done", "Job loaded from R2", {
+        "job_key": job_key,
+        "prompt": prompt,
+        "mode": os.environ.get("SANA_WM_MODE"),
+    })
+
+    JOB_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    start_image = JOB_INPUT_DIR / "start.png"
+    prompt_file = JOB_INPUT_DIR / "prompt.txt"
+    intrinsics_file = JOB_INPUT_DIR / "intrinsics.npy"
+
+    stage(s3, bucket, job_id, "REFERENCE_IMAGE_STARTED", "started", "Preparing reference image")
+
+    used_reference = download_reference_image_if_available(s3, bucket, job, start_image)
+    if not used_reference:
+        create_fallback_reference_image(prompt, start_image)
+
+    prompt_file.write_text(prompt, encoding="utf-8")
+    np.save(intrinsics_file, np.array([1000.0, 1000.0, 640.0, 352.0], dtype=np.float32))
+
+    stage(s3, bucket, job_id, "REFERENCE_IMAGE_READY", "done", "Reference image ready", {
+        "used_reference_image": used_reference
+    })
+
+    settings = choose_settings(job)
+
+    stage(s3, bucket, job_id, "SANA_GENERATION_STARTED", "started", "Starting official SANA-WM inference", {
+        "settings": settings,
+        "action": action,
+        "mode": os.environ.get("SANA_WM_MODE"),
+    })
+
+    existing_mp4s = {str(p) for p in RESULTS_DIR.rglob("*.mp4")}
+
+    command = [
+        "python",
+        "inference_video_scripts/inference_sana_wm.py",
+        "--image",
+        str(start_image),
+        "--prompt",
+        str(prompt_file),
+        "--intrinsics",
+        str(intrinsics_file),
+        "--action",
+        action,
+        "--num_frames",
+        str(settings["num_frames"]),
+        "--step",
+        str(settings["step"]),
+        "--output_dir",
+        str(RESULTS_DIR),
+        "--name",
+        job_id,
+    ]
+
+    if not settings["use_refiner"]:
+        command.append("--no_refiner")
+
+    run_command(command, SANA_HOME)
+
+    mp4_file = find_new_mp4(existing_mp4s, job_id)
+
+    stage(s3, bucket, job_id, "SANA_GENERATION_DONE", "done", "SANA-WM generated MP4", {
+        "local_mp4": str(mp4_file)
+    })
+
+    output_prefix = job.get("output_prefix")
+    if not output_prefix:
+        output_prefix = f"videos/sana-wm/outputs/{job_id}/"
+
+    if not output_prefix.endswith("/"):
+        output_prefix += "/"
+
+    video_key = output_prefix + "video.mp4"
+    metadata_key = job.get("metadata_key") or f"learning/job-history/{job_id}/metadata.json"
+    result_key = f"learning/job-history/{job_id}/result.json"
+
+    stage(s3, bucket, job_id, "R2_UPLOAD_STARTED", "started", "Uploading video to R2", {
+        "video_key": video_key
+    })
+
+    s3.upload_file(
+        str(mp4_file),
+        bucket,
+        video_key,
+        ExtraArgs={"ContentType": "video/mp4"},
+    )
+
+    temp_link = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": video_key},
+        ExpiresIn=604800,
+    )
+
+    completed = {
+        **job,
+        "job_id": job_id,
+        "status": "completed",
+        "model": "sana-wm",
+        "gpu_provider": "runpod",
+        "sana_wm_mode": os.environ.get("SANA_WM_MODE"),
+        "video_key": video_key,
+        "metadata_key": metadata_key,
+        "result_key": result_key,
+        "temporary_video_link": temp_link,
+        "settings": settings,
+        "used_reference_image": used_reference,
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    upload_json(s3, bucket, metadata_key, completed)
+    upload_json(s3, bucket, result_key, completed)
+
+    stage(s3, bucket, job_id, "R2_UPLOAD_DONE", "done", "Video uploaded to R2", {
+        "video_key": video_key,
+        "temporary_video_link": temp_link,
+    })
+
+    clear_active_job(s3, bucket, job_key)
+    stage(s3, bucket, job_id, "ACTIVE_JOB_CLEARED", "done", "Active job file removed from queue", {
+        "job_key": job_key
+    })
+
+    print("SANA_WM_JOB_SUCCESS", flush=True)
+    print("R2_UPLOAD_SUCCESS", flush=True)
+    print("R2_VIDEO_KEY=" + video_key, flush=True)
+    print("R2_TEMP_VIDEO_LINK=" + temp_link, flush=True)
+
+    return job_id
 
 
 def main():
@@ -141,157 +301,57 @@ def main():
     job_key = os.environ.get("JOB_KEY", "jobs/sana-wm/active/current.json")
     s3 = s3_client()
 
-    startup_job_id = "runpod-startup-" + now_id()
+    print("WORKER_LOOP_STARTED", flush=True)
+    print(f"Polling every {POLL_SECONDS} seconds for job: {job_key}", flush=True)
 
-    try:
-        stage(s3, bucket, startup_job_id, "JOB_LOAD_STARTED", "started", f"Reading {job_key}")
-        job = load_job(s3, bucket, job_key)
+    while True:
+        startup_job_id = "runpod-startup-" + now_id()
+        job_id = startup_job_id
 
-        job_id = job.get("job_id") or ("sana-wm-runpod-" + now_id())
-        prompt = job.get("prompt") or job.get("video_prompt") or "A peaceful cinematic nature scene."
-        action = job.get("action") or "w-80,jw-40,w-40,lw-60,w-100"
-
-        stage(s3, bucket, job_id, "JOB_LOAD_DONE", "done", "Job loaded from R2", {
-            "job_key": job_key,
-            "prompt": prompt,
-            "mode": os.environ.get("SANA_WM_MODE"),
-        })
-
-        JOB_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-        start_image = JOB_INPUT_DIR / "start.png"
-        prompt_file = JOB_INPUT_DIR / "prompt.txt"
-        intrinsics_file = JOB_INPUT_DIR / "intrinsics.npy"
-
-        stage(s3, bucket, job_id, "REFERENCE_IMAGE_STARTED", "started", "Preparing reference image")
-
-        used_reference = download_reference_image_if_available(s3, bucket, job, start_image)
-
-        if not used_reference:
-            create_fallback_reference_image(prompt, start_image)
-
-        prompt_file.write_text(prompt, encoding="utf-8")
-        np.save(intrinsics_file, np.array([1000.0, 1000.0, 640.0, 352.0], dtype=np.float32))
-
-        stage(s3, bucket, job_id, "REFERENCE_IMAGE_READY", "done", "Reference image ready", {
-            "used_reference_image": used_reference
-        })
-
-        settings = choose_settings(job)
-
-        stage(s3, bucket, job_id, "SANA_GENERATION_STARTED", "started", "Starting official SANA-WM inference", {
-            "settings": settings,
-            "action": action,
-            "mode": os.environ.get("SANA_WM_MODE"),
-        })
-
-        command = [
-            "python",
-            "inference_video_scripts/inference_sana_wm.py",
-            "--image",
-            str(start_image),
-            "--prompt",
-            str(prompt_file),
-            "--intrinsics",
-            str(intrinsics_file),
-            "--action",
-            action,
-            "--num_frames",
-            str(settings["num_frames"]),
-            "--step",
-            str(settings["step"]),
-            "--output_dir",
-            str(RESULTS_DIR),
-            "--name",
-            job_id,
-        ]
-
-        if not settings["use_refiner"]:
-            command.append("--no_refiner")
-
-        run_command(command, SANA_HOME)
-
-        mp4_file = find_mp4()
-
-        stage(s3, bucket, job_id, "SANA_GENERATION_DONE", "done", "SANA-WM generated MP4", {
-            "local_mp4": str(mp4_file)
-        })
-
-        output_prefix = job.get("output_prefix")
-        if not output_prefix:
-            output_prefix = f"videos/sana-wm/outputs/{job_id}/"
-
-        if not output_prefix.endswith("/"):
-            output_prefix += "/"
-
-        video_key = output_prefix + "video.mp4"
-        metadata_key = job.get("metadata_key") or f"learning/job-history/{job_id}/metadata.json"
-        result_key = f"learning/job-history/{job_id}/result.json"
-
-        stage(s3, bucket, job_id, "R2_UPLOAD_STARTED", "started", "Uploading video to R2", {
-            "video_key": video_key
-        })
-
-        s3.upload_file(
-            str(mp4_file),
-            bucket,
-            video_key,
-            ExtraArgs={"ContentType": "video/mp4"},
-        )
-
-        temp_link = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket, "Key": video_key},
-            ExpiresIn=604800,
-        )
-
-        completed = {
-            **job,
-            "job_id": job_id,
-            "status": "completed",
-            "model": "sana-wm",
-            "gpu_provider": "runpod",
-            "sana_wm_mode": os.environ.get("SANA_WM_MODE"),
-            "video_key": video_key,
-            "metadata_key": metadata_key,
-            "result_key": result_key,
-            "temporary_video_link": temp_link,
-            "settings": settings,
-            "used_reference_image": used_reference,
-            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-
-        upload_json(s3, bucket, metadata_key, completed)
-        upload_json(s3, bucket, result_key, completed)
-
-        stage(s3, bucket, job_id, "R2_UPLOAD_DONE", "done", "Video uploaded to R2", {
-            "video_key": video_key,
-            "temporary_video_link": temp_link,
-        })
-
-        print("SANA_WM_JOB_SUCCESS", flush=True)
-        print("R2_UPLOAD_SUCCESS", flush=True)
-        print("R2_VIDEO_KEY=" + video_key, flush=True)
-        print("R2_TEMP_VIDEO_LINK=" + temp_link, flush=True)
-
-    except Exception as exc:
-        failed_job_id = locals().get("job_id", startup_job_id)
         try:
-            stage(s3, bucket, failed_job_id, "FAILED_AT_STAGE", "failed", str(exc), {
-                "job_key": job_key
-            })
-            upload_json(s3, bucket, f"learning/mistakes/{failed_job_id}/error.json", {
-                "job_id": failed_job_id,
-                "error": str(exc),
-                "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            })
-        except Exception:
-            pass
+            stage(s3, bucket, startup_job_id, "JOB_LOAD_STARTED", "started", f"Reading {job_key}")
 
-        print("SANA_WM_JOB_FAILED", flush=True)
-        print(str(exc), flush=True)
-        raise
+            try:
+                job = load_job(s3, bucket, job_key)
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code in ("NoSuchKey", "404"):
+                    print(f"NO_JOB_FOUND waiting {POLL_SECONDS}s", flush=True)
+                    time.sleep(POLL_SECONDS)
+                    continue
+                raise
+
+            job_id = process_one_job(s3, bucket, job_key, job)
+            print(f"JOB_DONE waiting {POLL_SECONDS}s for next job", flush=True)
+            time.sleep(POLL_SECONDS)
+
+        except Exception as exc:
+            try:
+                stage(s3, bucket, job_id, "FAILED_AT_STAGE", "failed", str(exc), {
+                    "job_key": job_key
+                })
+                upload_json(s3, bucket, f"learning/mistakes/{job_id}/error.json", {
+                    "job_id": job_id,
+                    "error": str(exc),
+                    "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                })
+
+                # prevent the same broken active job from retrying forever
+                try:
+                    clear_active_job(s3, bucket, job_key)
+                    stage(s3, bucket, job_id, "ACTIVE_JOB_CLEARED_AFTER_FAILURE", "done", "Broken active job file removed from queue", {
+                        "job_key": job_key
+                    })
+                except Exception as clear_err:
+                    print(f"Could not clear failed active job: {clear_err}", flush=True)
+
+            except Exception:
+                pass
+
+            print("SANA_WM_JOB_FAILED", flush=True)
+            print(str(exc), flush=True)
+            print(f"Sleeping {POLL_SECONDS}s before checking for next job", flush=True)
+            time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
