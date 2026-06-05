@@ -8,22 +8,21 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import boto3
-from botocore.client import Config
-from botocore.exceptions import ClientError
-from PIL import Image
 import numpy as np
+from PIL import Image
+from botocore.client import Config
 
 
 def env(name, default=""):
     return str(os.environ.get(name, default)).strip()
 
 
-def now():
+def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
 def log(message):
-    print(f"{message}", flush=True)
+    print(message, flush=True)
 
 
 R2_BUCKET = env("R2_BUCKET", "wankelpie")
@@ -34,13 +33,14 @@ R2_ENDPOINT = env("R2_ENDPOINT") or (
 R2_ACCESS_KEY_ID = env("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = env("R2_SECRET_ACCESS_KEY")
 
-ACTIVE_PREFIX = env("R2_ACTIVE_PREFIX", "jobs/active/").strip("/") + "/"
-RUNNING_PREFIX = env("R2_RUNNING_PREFIX", "jobs/running/").strip("/") + "/"
-DONE_PREFIX = env("R2_DONE_PREFIX", "jobs/done/").strip("/") + "/"
-FAILED_PREFIX = env("R2_FAILED_PREFIX", "jobs/failed/").strip("/") + "/"
-OUTPUT_PREFIX = env("R2_OUTPUT_PREFIX", "videos/sana-wm/outputs/").strip("/") + "/"
+R2_ACTIVE_PREFIX = env("R2_ACTIVE_PREFIX", "jobs/active/").strip("/") + "/"
+R2_RUNNING_PREFIX = env("R2_RUNNING_PREFIX", "jobs/running/").strip("/") + "/"
+R2_DONE_PREFIX = env("R2_DONE_PREFIX", "jobs/done/").strip("/") + "/"
+R2_FAILED_PREFIX = env("R2_FAILED_PREFIX", "jobs/failed/").strip("/") + "/"
+R2_OUTPUT_PREFIX = env("R2_OUTPUT_PREFIX", "videos/sana-wm/outputs/").strip("/") + "/"
 
 POLL_SECONDS = int(env("POLL_SECONDS", "30"))
+
 WORKSPACE = Path(env("WORKSPACE", "/workspace"))
 SANA_DIR = WORKSPACE / "Sana"
 JOB_INPUT_DIR = WORKSPACE / "job-input"
@@ -49,13 +49,20 @@ RESULTS_DIR = WORKSPACE / "results"
 SANA_FRAMES = int(env("SANA_FRAMES", "321"))
 SANA_STEPS = int(env("SANA_STEPS", "20"))
 SANA_ACTION = env("SANA_ACTION", "w-80,jw-40,w-40,lw-60,w-100")
+SANA_NO_REFINER = env("SANA_NO_REFINER", "false").lower() == "true"
 
 NO_ACTION_OVERLAY = env("NO_ACTION_OVERLAY", "true").lower() != "false"
 
 
-def s3_client():
-    if not R2_ENDPOINT or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
-        raise RuntimeError("Missing R2 endpoint or R2 access keys.")
+def make_s3_client():
+    if not R2_ENDPOINT:
+        raise RuntimeError("Missing R2_ENDPOINT or R2_ACCOUNT_ID.")
+
+    if not R2_ACCESS_KEY_ID:
+        raise RuntimeError("Missing R2_ACCESS_KEY_ID.")
+
+    if not R2_SECRET_ACCESS_KEY:
+        raise RuntimeError("Missing R2_SECRET_ACCESS_KEY.")
 
     return boto3.client(
         "s3",
@@ -67,45 +74,49 @@ def s3_client():
     )
 
 
-s3 = s3_client()
+s3 = make_s3_client()
 
 
-def list_active_job_keys():
+def list_named_active_jobs():
     paginator = s3.get_paginator("list_objects_v2")
-    keys = []
+    jobs = []
 
-    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=ACTIVE_PREFIX):
+    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=R2_ACTIVE_PREFIX):
         for item in page.get("Contents", []):
             key = item.get("Key", "")
-            name = key.split("/")[-1]
+            filename = key.split("/")[-1]
 
             if not key.endswith(".json"):
                 continue
 
-            if name == "current.json":
+            if filename == "current.json":
                 continue
 
-            if not name.startswith("sana-wm-"):
+            if not filename.startswith("sana-wm-"):
                 continue
 
-            keys.append(
+            jobs.append(
                 {
                     "key": key,
                     "modified": item.get("LastModified"),
                 }
             )
 
-    keys.sort(key=lambda item: item["modified"] or datetime.min.replace(tzinfo=timezone.utc))
-    return [item["key"] for item in keys]
+    jobs.sort(
+        key=lambda item: item["modified"]
+        or datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+    return [item["key"] for item in jobs]
 
 
-def get_json(key):
+def get_json_from_r2(key):
     response = s3.get_object(Bucket=R2_BUCKET, Key=key)
     body = response["Body"].read().decode("utf-8")
     return json.loads(body)
 
 
-def put_json(key, data):
+def put_json_to_r2(key, data):
     s3.put_object(
         Bucket=R2_BUCKET,
         Key=key,
@@ -115,12 +126,12 @@ def put_json(key, data):
     log(f"wrote {key}")
 
 
-def delete_key(key):
+def delete_r2_key(key):
     s3.delete_object(Bucket=R2_BUCKET, Key=key)
     log(f"deleted {key}")
 
 
-def upload_file(local_path, key, content_type):
+def upload_file_to_r2(local_path, key, content_type):
     with open(local_path, "rb") as file:
         s3.put_object(
             Bucket=R2_BUCKET,
@@ -128,15 +139,16 @@ def upload_file(local_path, key, content_type):
             Body=file,
             ContentType=content_type,
         )
+
     log(f"uploaded {key}")
 
 
-def download_file(key, local_path):
+def download_file_from_r2(key, local_path):
     local_path.parent.mkdir(parents=True, exist_ok=True)
     s3.download_file(R2_BUCKET, key, str(local_path))
 
 
-def ensure_default_reference_image(path):
+def create_default_reference_image(path):
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if path.exists():
@@ -146,7 +158,7 @@ def ensure_default_reference_image(path):
     image.save(path)
 
 
-def ensure_intrinsics(path, frames):
+def create_default_intrinsics(path, frames):
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if path.exists():
@@ -166,36 +178,36 @@ def prepare_job_input(job):
     prompt_path.write_text(prompt, encoding="utf-8")
 
     image_path = JOB_INPUT_DIR / "start.png"
-    reference_image_key = (
+    image_key = (
         job.get("reference_image_key")
         or job.get("image_key")
         or job.get("r2_reference_image_key")
     )
 
-    if reference_image_key:
-        download_file(reference_image_key, image_path)
+    if image_key:
+        download_file_from_r2(image_key, image_path)
     else:
-        ensure_default_reference_image(image_path)
+        create_default_reference_image(image_path)
 
     intrinsics_path = JOB_INPUT_DIR / "intrinsics.npy"
     intrinsics_key = job.get("intrinsics_key") or job.get("r2_intrinsics_key")
 
     if intrinsics_key:
-        download_file(intrinsics_key, intrinsics_path)
+        download_file_from_r2(intrinsics_key, intrinsics_path)
     else:
-        ensure_intrinsics(intrinsics_path, SANA_FRAMES)
+        create_default_intrinsics(intrinsics_path, SANA_FRAMES)
 
     return prompt_path, image_path, intrinsics_path
 
 
-def find_output_mp4(job_id):
+def find_generated_mp4(job_id):
     patterns = [
         str(RESULTS_DIR / f"{job_id}_generated.mp4"),
         str(RESULTS_DIR / "*.mp4"),
-        str(WORKSPACE / "outputs" / "**" / "*.mp4"),
     ]
 
     files = []
+
     for pattern in patterns:
         files.extend(glob.glob(pattern, recursive=True))
 
@@ -203,17 +215,18 @@ def find_output_mp4(job_id):
         return ""
 
     files.sort(key=lambda path: os.path.getsize(path), reverse=True)
+
     return files[0]
 
 
-def run_sana(job):
+def run_sana_wm(job):
     job_id = job["job_id"]
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    for old_mp4 in glob.glob(str(RESULTS_DIR / "*.mp4")):
+    for old_file in glob.glob(str(RESULTS_DIR / "*.mp4")):
         try:
-            os.remove(old_mp4)
+            os.remove(old_file)
         except Exception:
             pass
 
@@ -243,6 +256,9 @@ def run_sana(job):
     if NO_ACTION_OVERLAY:
         command.append("--no_action_overlay")
 
+    if SANA_NO_REFINER:
+        command.append("--no_refiner")
+
     log("SANA_GENERATION_STARTED: started Starting official SANA-WM inference")
     log("COMMAND: " + " ".join(command))
 
@@ -262,93 +278,109 @@ def run_sana(job):
     if result.returncode != 0:
         raise RuntimeError(f"SANA-WM failed with exit code {result.returncode}")
 
-    mp4_path = find_output_mp4(job_id)
+    mp4_path = find_generated_mp4(job_id)
 
     if not mp4_path:
         raise RuntimeError("SANA-WM finished but no MP4 was found.")
 
-    log("SANA_GENERATION_DONE: done SANA-WM generated MP4")
+    log("SANA_GENERATION_DONE: done SANA-WM generated raw MP4")
     return Path(mp4_path), log_path
 
 
-def process_job(active_key):
-    job = get_json(active_key)
-    job_id = job.get("job_id") or Path(active_key).stem
+def process_one_job(active_job_key):
+    job = get_json_from_r2(active_job_key)
+
+    job_id = job.get("job_id") or Path(active_job_key).stem
     job["job_id"] = job_id
 
-    running_key = RUNNING_PREFIX + f"{job_id}.json"
-    done_key = DONE_PREFIX + f"{job_id}.json"
-    failed_key = FAILED_PREFIX + f"{job_id}.json"
-    output_video_key = OUTPUT_PREFIX + f"{job_id}/video.mp4"
-    output_log_key = OUTPUT_PREFIX + f"{job_id}/generation.log"
-    output_job_key = OUTPUT_PREFIX + f"{job_id}/job.json"
+    running_key = R2_RUNNING_PREFIX + f"{job_id}.json"
+    done_key = R2_DONE_PREFIX + f"{job_id}.json"
+    failed_key = R2_FAILED_PREFIX + f"{job_id}.json"
+
+    output_folder = R2_OUTPUT_PREFIX + f"{job_id}/"
+    output_video_key = output_folder + "video.mp4"
+    output_log_key = output_folder + "generation.log"
+    output_job_key = output_folder + "job.json"
 
     running_job = dict(job)
     running_job["status"] = "running"
-    running_job["active_job_key"] = active_key
-    running_job["worker_started_at"] = now()
+    running_job["active_job_key"] = active_job_key
+    running_job["worker_started_at"] = now_iso()
     running_job["no_action_overlay"] = NO_ACTION_OVERLAY
 
-    put_json(running_key, running_job)
+    put_json_to_r2(running_key, running_job)
 
     try:
-        mp4_path, log_path = run_sana(job)
+        mp4_path, log_path = run_sana_wm(job)
 
-        log("R2_UPLOAD_STARTED: started Uploading video to R2")
-        upload_file(mp4_path, output_video_key, "video/mp4")
-        upload_file(log_path, output_log_key, "text/plain")
+        log("R2_UPLOAD_STARTED: started Uploading raw MP4 to R2")
+        upload_file_to_r2(mp4_path, output_video_key, "video/mp4")
+        upload_file_to_r2(log_path, output_log_key, "text/plain")
 
         done_job = dict(job)
         done_job["status"] = "done"
-        done_job["active_job_key"] = active_key
-        done_job["worker_finished_at"] = now()
+        done_job["active_job_key"] = active_job_key
+        done_job["worker_finished_at"] = now_iso()
         done_job["output_video_key"] = output_video_key
-        done_job["output_folder"] = OUTPUT_PREFIX + f"{job_id}/"
+        done_job["output_folder"] = output_folder
         done_job["no_action_overlay"] = NO_ACTION_OVERLAY
 
-        put_json(done_key, done_job)
-        put_json(output_job_key, done_job)
+        put_json_to_r2(done_key, done_job)
+        put_json_to_r2(output_job_key, done_job)
 
-        delete_key(active_key)
+        delete_r2_key(active_job_key)
+
+        temp_link = s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": R2_BUCKET,
+                "Key": output_video_key,
+            },
+            ExpiresIn=604800,
+        )
 
         log("SANA_WM_JOB_SUCCESS")
         log("R2_UPLOAD_SUCCESS")
         log(f"R2_VIDEO_KEY={output_video_key}")
-        log(f"ACTIVE_JOB_DELETED={active_key}")
+        log(f"R2_TEMP_VIDEO_LINK={temp_link}")
+        log(f"ACTIVE_JOB_DELETED={active_job_key}")
 
     except Exception as error:
         failed_job = dict(job)
         failed_job["status"] = "failed"
-        failed_job["active_job_key"] = active_key
-        failed_job["worker_failed_at"] = now()
+        failed_job["active_job_key"] = active_job_key
+        failed_job["worker_failed_at"] = now_iso()
         failed_job["error"] = str(error)
         failed_job["no_action_overlay"] = NO_ACTION_OVERLAY
 
-        put_json(failed_key, failed_job)
+        put_json_to_r2(failed_key, failed_job)
 
         log(f"SANA_WM_JOB_FAILED: {error}")
-        log(f"ACTIVE_JOB_NOT_DELETED={active_key}")
+        log(f"ACTIVE_JOB_NOT_DELETED={active_job_key}")
 
 
 def main():
     log("WORKER_LOOP_STARTED")
-    log(f"Polling every {POLL_SECONDS} seconds for jobs under: {ACTIVE_PREFIX}")
-    log("Queue mode: named sana-wm-xxxx.json files only")
+    log(f"Polling every {POLL_SECONDS} seconds")
+    log(f"Queue folder: {R2_BUCKET}/{R2_ACTIVE_PREFIX}")
+    log("Queue mode: named job files only, example sana-wm-xxxx.json")
     log(f"No action overlay: {NO_ACTION_OVERLAY}")
 
     while True:
         try:
-            log(f"JOB_SCAN_STARTED: reading {ACTIVE_PREFIX}*.json")
-            keys = list_active_job_keys()
+            log(f"JOB_SCAN_STARTED: scanning {R2_ACTIVE_PREFIX}")
 
-            if not keys:
+            active_jobs = list_named_active_jobs()
+
+            if not active_jobs:
                 log(f"NO_JOB_FOUND waiting {POLL_SECONDS}s")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            active_key = keys[0]
-            log(f"JOB_FOUND: {active_key}")
-            process_job(active_key)
+            active_job_key = active_jobs[0]
+
+            log(f"JOB_FOUND: {active_job_key}")
+            process_one_job(active_job_key)
             log(f"JOB_DONE waiting {POLL_SECONDS}s for next job")
 
         except Exception as error:
