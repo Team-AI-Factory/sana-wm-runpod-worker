@@ -22,7 +22,7 @@ def now_iso():
 
 
 def log(message):
-    print(message, flush=True)
+    print(str(message), flush=True)
 
 
 R2_BUCKET = env("R2_BUCKET", "wankelpie")
@@ -46,12 +46,102 @@ SANA_DIR = WORKSPACE / "Sana"
 JOB_INPUT_DIR = WORKSPACE / "job-input"
 RESULTS_DIR = WORKSPACE / "results"
 
-SANA_FRAMES = int(env("SANA_FRAMES", "321"))
-SANA_STEPS = int(env("SANA_STEPS", "20"))
-SANA_ACTION = env("SANA_ACTION", "w-80,jw-40,w-40,lw-60,w-100")
-SANA_NO_REFINER = env("SANA_NO_REFINER", "false").lower() == "true"
 
+def make_valid_sana_frames(value):
+    """
+    SANA-WM / LTX VAE wants frame counts shaped like 8k+1.
+    Examples: 321, 641, 1041.
+    If user accidentally sets 1040, this safely changes it to 1041.
+    """
+    try:
+        frames = int(value)
+    except Exception:
+        frames = 321
+
+    if frames < 9:
+        frames = 321
+
+    remainder = (frames - 1) % 8
+
+    if remainder == 0:
+        return frames
+
+    fixed = frames + (8 - remainder)
+    log(f"SANA_FRAMES_AUTO_FIXED: {frames} -> {fixed} because SANA-WM requires 8k+1 frames")
+    return fixed
+
+
+SANA_FRAMES = make_valid_sana_frames(env("SANA_FRAMES", "321"))
+SANA_STEPS = int(env("SANA_STEPS", "20"))
+SANA_NO_REFINER = env("SANA_NO_REFINER", "false").lower() == "true"
 NO_ACTION_OVERLAY = env("NO_ACTION_OVERLAY", "true").lower() != "false"
+
+
+def make_action_for_frames(frames):
+    """
+    Action segments must add up to frames - 1.
+    Old default was 80+40+40+60+100 = 320, giving 321 frames.
+    This scales that same movement pattern to the requested length.
+    """
+    total = frames - 1
+
+    if total <= 0:
+        total = 320
+
+    weights = [80, 40, 40, 60, 100]
+    labels = ["w", "jw", "w", "lw", "w"]
+    base = sum(weights)
+
+    parts = []
+    used = 0
+
+    for index, weight in enumerate(weights):
+        if index == len(weights) - 1:
+            count = total - used
+        else:
+            count = max(1, round(total * weight / base))
+            used += count
+
+        parts.append(f"{labels[index]}-{count}")
+
+    return ",".join(parts)
+
+
+def parse_action_total(action):
+    total = 0
+
+    for part in str(action or "").split(","):
+        if "-" not in part:
+            continue
+
+        try:
+            total += int(part.split("-")[-1])
+        except Exception:
+            pass
+
+    return total
+
+
+def get_sana_action():
+    raw_action = env("SANA_ACTION", "")
+
+    if not raw_action or raw_action.lower() == "auto":
+        action = make_action_for_frames(SANA_FRAMES)
+        log(f"SANA_ACTION_AUTO_CREATED: {action}")
+        return action
+
+    total = parse_action_total(raw_action)
+    expected = SANA_FRAMES - 1
+
+    if total != expected:
+        action = make_action_for_frames(SANA_FRAMES)
+        log(f"SANA_ACTION_AUTO_FIXED: old total {total}, expected {expected}. New action: {action}")
+        return action
+
+    return raw_action
+
+
+SANA_ACTION = get_sana_action()
 
 
 def make_s3_client():
@@ -158,14 +248,16 @@ def create_default_reference_image(path):
     image.save(path)
 
 
-def create_default_intrinsics(path, frames):
+def create_default_intrinsics(path):
+    """
+    Important fix:
+    SANA accepts intrinsics shape (4,), (3,3), or (F,3,3).
+    The old worker created (1040,4), which caused the crash.
+    This creates simple shape (4,), which SANA accepts.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    if path.exists():
-        return
-
     intrinsics = np.array([900.0, 900.0, 640.0, 352.0], dtype=np.float32)
-    intrinsics = np.broadcast_to(intrinsics, (frames, 4)).copy()
     np.save(path, intrinsics)
 
 
@@ -195,7 +287,7 @@ def prepare_job_input(job):
     if intrinsics_key:
         download_file_from_r2(intrinsics_key, intrinsics_path)
     else:
-        create_default_intrinsics(intrinsics_path, SANA_FRAMES)
+        create_default_intrinsics(intrinsics_path)
 
     return prompt_path, image_path, intrinsics_path
 
@@ -219,9 +311,7 @@ def find_generated_mp4(job_id):
     return files[0]
 
 
-def run_sana_wm(job):
-    job_id = job["job_id"]
-
+def clean_old_results():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     for old_file in glob.glob(str(RESULTS_DIR / "*.mp4")):
@@ -229,6 +319,18 @@ def run_sana_wm(job):
             os.remove(old_file)
         except Exception:
             pass
+
+    for old_file in glob.glob(str(RESULTS_DIR / "*.log")):
+        try:
+            os.remove(old_file)
+        except Exception:
+            pass
+
+
+def run_sana_wm(job):
+    job_id = job["job_id"]
+
+    clean_old_results()
 
     prompt_path, image_path, intrinsics_path = prepare_job_input(job)
 
@@ -307,6 +409,9 @@ def process_one_job(active_job_key):
     running_job["active_job_key"] = active_job_key
     running_job["worker_started_at"] = now_iso()
     running_job["no_action_overlay"] = NO_ACTION_OVERLAY
+    running_job["sana_frames"] = SANA_FRAMES
+    running_job["sana_action"] = SANA_ACTION
+    running_job["sana_steps"] = SANA_STEPS
 
     put_json_to_r2(running_key, running_job)
 
@@ -324,6 +429,9 @@ def process_one_job(active_job_key):
         done_job["output_video_key"] = output_video_key
         done_job["output_folder"] = output_folder
         done_job["no_action_overlay"] = NO_ACTION_OVERLAY
+        done_job["sana_frames"] = SANA_FRAMES
+        done_job["sana_action"] = SANA_ACTION
+        done_job["sana_steps"] = SANA_STEPS
 
         put_json_to_r2(done_key, done_job)
         put_json_to_r2(output_job_key, done_job)
@@ -352,11 +460,18 @@ def process_one_job(active_job_key):
         failed_job["worker_failed_at"] = now_iso()
         failed_job["error"] = str(error)
         failed_job["no_action_overlay"] = NO_ACTION_OVERLAY
+        failed_job["sana_frames"] = SANA_FRAMES
+        failed_job["sana_action"] = SANA_ACTION
+        failed_job["sana_steps"] = SANA_STEPS
 
         put_json_to_r2(failed_key, failed_job)
 
+        # Important: remove the exact failed active job so the worker does not retry
+        # the same broken job forever every 30 seconds.
+        delete_r2_key(active_job_key)
+
         log(f"SANA_WM_JOB_FAILED: {error}")
-        log(f"ACTIVE_JOB_NOT_DELETED={active_job_key}")
+        log(f"ACTIVE_JOB_DELETED_AFTER_FAILURE={active_job_key}")
 
 
 def main():
@@ -365,6 +480,9 @@ def main():
     log(f"Queue folder: {R2_BUCKET}/{R2_ACTIVE_PREFIX}")
     log("Queue mode: named job files only, example sana-wm-xxxx.json")
     log(f"No action overlay: {NO_ACTION_OVERLAY}")
+    log(f"SANA frames: {SANA_FRAMES}")
+    log(f"SANA action: {SANA_ACTION}")
+    log(f"SANA steps: {SANA_STEPS}")
 
     while True:
         try:
